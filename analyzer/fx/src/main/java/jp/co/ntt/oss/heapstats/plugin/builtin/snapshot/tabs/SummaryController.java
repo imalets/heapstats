@@ -17,14 +17,6 @@
  */
 package jp.co.ntt.oss.heapstats.plugin.builtin.snapshot.tabs;
 
-import java.net.URL;
-import java.time.ZoneId;
-import java.util.Locale;
-import java.util.ResourceBundle;
-import java.util.function.Consumer;
-import java.util.stream.Collectors;
-import java.util.stream.IntStream;
-import java.util.stream.Stream;
 import javafx.application.Platform;
 import javafx.beans.property.ObjectProperty;
 import javafx.beans.property.SimpleObjectProperty;
@@ -35,27 +27,28 @@ import javafx.concurrent.Task;
 import javafx.event.EventHandler;
 import javafx.fxml.FXML;
 import javafx.fxml.Initializable;
-import javafx.scene.chart.AreaChart;
-import javafx.scene.chart.LineChart;
-import javafx.scene.chart.NumberAxis;
-import javafx.scene.chart.StackedAreaChart;
-import javafx.scene.chart.XYChart;
-import javafx.scene.control.ContentDisplay;
-import javafx.scene.control.Label;
-import javafx.scene.control.TableColumn;
-import javafx.scene.control.TableView;
-import javafx.scene.control.Tooltip;
+import javafx.scene.Node;
+import javafx.scene.chart.*;
+import javafx.scene.control.*;
 import javafx.scene.control.cell.PropertyValueFactory;
 import javafx.scene.input.MouseEvent;
 import javafx.scene.layout.AnchorPane;
 import javafx.scene.layout.GridPane;
-import javafx.scene.paint.Color;
 import javafx.scene.shape.Path;
 import javafx.scene.shape.Rectangle;
 import jp.co.ntt.oss.heapstats.container.snapshot.SnapShotHeader;
 import jp.co.ntt.oss.heapstats.container.snapshot.SummaryData;
 import jp.co.ntt.oss.heapstats.utils.EpochTimeConverter;
 import jp.co.ntt.oss.heapstats.utils.HeapStatsUtils;
+
+import java.net.URL;
+import java.time.ZoneId;
+import java.util.Locale;
+import java.util.ResourceBundle;
+import java.util.function.Consumer;
+import java.util.stream.Collectors;
+import java.util.stream.IntStream;
+import java.util.stream.Stream;
 
 /**
  * FXML Controller class for "Summary Data" tab in SnapShot plugin.
@@ -408,16 +401,28 @@ public class SummaryController implements Initializable {
             Tooltip tooltip = new Tooltip();
 
             /* Insatances */
-            instances.getData()
-                     .stream()
-                     .peek(d -> Tooltip.install(d.getNode(), tooltip))
-                     .forEach(d -> d.getNode().addEventHandler(MouseEvent.MOUSE_ENTERED_TARGET, e -> tooltip.setText((epochTimeConverter.toString(d.getXValue()) + ": " + d.getYValue()))));
+            Stream<Node> instancesStream = instances.getData()
+                                                      .stream()
+                                                      .peek(d -> Tooltip.install(d.getNode(), tooltip))
+                                                      .peek(d -> d.getNode().addEventHandler(MouseEvent.MOUSE_ENTERED_TARGET, e -> tooltip.setText((epochTimeConverter.toString(d.getXValue()) + ": " + d.getYValue()))))
+                                                      .map(XYChart.Data::getNode);
 
             /* GC time */
-            gcTime.getData()
-                  .stream()
-                  .peek(d -> Tooltip.install(d.getNode(), tooltip))
-                  .forEach(d -> d.getNode().addEventHandler(MouseEvent.MOUSE_ENTERED_TARGET, e -> tooltip.setText(String.format("%s: %d ms", epochTimeConverter.toString(d.getXValue()), d.getYValue()))));
+            Stream<Node> gcTimeStream = gcTime.getData()
+                                               .stream()
+                                               .peek(d -> Tooltip.install(d.getNode(), tooltip))
+                                               .peek(d -> d.getNode().addEventHandler(MouseEvent.MOUSE_ENTERED_TARGET, e -> tooltip.setText(String.format("%s: %d ms", epochTimeConverter.toString(d.getXValue()), d.getYValue()))))
+                                               .map(XYChart.Data::getNode);
+
+            /* Nodes of XYChart.Data in AreaChart */
+            Stream<Node> areaChartData = Stream.of(youngUsage, oldUsage, free, metaspaceUsage, metaspaceCapacity)
+                                               .flatMap(s -> s.getData().stream())
+                                               .map(XYChart.Data::getNode);
+
+            /* Set event handler to symbol nodes on each cheart. */
+            Stream.concat(Stream.concat(instancesStream, gcTimeStream), areaChartData)
+                  .peek(n -> n.addEventHandler(MouseEvent.MOUSE_ENTERED_TARGET, e -> n.setOpacity(1.0)))
+                  .forEach(n -> n.addEventHandler(MouseEvent.MOUSE_EXITED_TARGET, e -> n.setOpacity(0.0)));
         }
 
     }

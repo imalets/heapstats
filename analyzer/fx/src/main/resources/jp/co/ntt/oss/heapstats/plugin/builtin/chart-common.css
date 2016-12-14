@@ -1,5 +1,5 @@
 /*
- * Copyright (C) 2014-2016 Yasumasa Suenaga
+ * Copyright (C) 2016 Yasumasa Suenaga
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -16,33 +16,14 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
  */
 
-/* 
-    Created on : 2014/05/14, 22:49:20
-    Author     : Yasumasa Suenaga
-*/
-
-@import url("/jp/co/ntt/oss/heapstats/plugin/builtin/chart-common.css");
-
-/* instance */
-#instanceChart .series0 {
-    -fx-stroke: blue;
-    -fx-background-color: white, blue;
+/* All chart symbols are hidden by default */
+.chart-line-symbol{
+    -fx-opacity: 0.0;
+    -fx-background-radius: 7px;
+    -fx-padding: 8px;
 }
-
-/* GC time */
-#gcTimeChart .series0 {
-    -fx-stroke: orange;
-    -fx-background-color: white, orange;
-}
-
-/* Metaspace */
-#metaspaceChart .series0 {
-    -fx-fill: red;
-    -fx-stroke: red;
-    -fx-background-color: white, red;
-}
-#metaspaceChart .series1 {
-    -fx-fill: blue;
-    -fx-stroke: blue;
-    -fx-background-color: white, blue;
+.chart-area-symbol{
+    -fx-opacity: 0.0;
+    -fx-background-radius: 7px;
+    -fx-padding: 8px;
 }

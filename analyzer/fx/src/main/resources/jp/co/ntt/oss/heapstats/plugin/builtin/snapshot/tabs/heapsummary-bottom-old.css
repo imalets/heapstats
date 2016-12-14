@@ -21,18 +21,20 @@
     Author     : Yasumasa
 */
 
+@import url("/jp/co/ntt/oss/heapstats/plugin/builtin/chart-common.css");
+
 #heapChart .series0 {
     -fx-fill: limegreen;
     -fx-stroke: limegreen;
-    -fx-background-color: limegreen, white;
+    -fx-background-color: white, limegreen;
 }
 #heapChart .series1 {
     -fx-fill: blue;
     -fx-stroke: blue;
-    -fx-background-color: blue, white;
+    -fx-background-color: white, blue;
 }
 #heapChart .series2 {
     -fx-fill: red;
     -fx-stroke: red;
-    -fx-background-color: red, white;
+    -fx-background-color: white, red;
 }
