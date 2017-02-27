@@ -34,7 +34,6 @@
 typedef struct {
   TSnapShotContainer *snapshot;  /*!< Container of taking snapshot. */
   TClassCounter *counter;        /*!< Counter of class heap usage.  */
-  TClassContainer *clsContainer; /*!< Container of class data.      */
 } TCollectContainers;
 
 /* Variable defines. */
@@ -301,26 +300,14 @@ void OnG1GarbageCollectionFinish(void) {
 
 /*!
  * \brief Get class information.
- * \param aClsContainer [in] Search target class container.
  * \param klassOop      [in] Pointer of child java class object(KlassOopDesc).
  * \return Pointer of information of expceted class by klassOop.
  */
-inline TObjectData *getObjectDataFromKlassOop(TClassContainer *aClsContainer,
-                                              void *klassOop) {
-  TObjectData *clsData = NULL;
-
-  /* Search child class at local class container. */
-  clsData = aClsContainer->findClass(klassOop);
+inline TObjectData *getObjectDataFromKlassOop(void *klassOop) {
+  TObjectData *clsData = clsContainer->findClass(klassOop);
   if (unlikely(clsData == NULL)) {
-    /* Search child class at root class container. */
-    clsData = clsContainer->findClass(klassOop);
-    if (unlikely(clsData == NULL)) {
-      /* Push new loaded class to root class container. */
-      clsData = clsContainer->pushNewClass(klassOop);
-    } else {
-      /* Push a loaded class to local class container. */
-      aClsContainer->pushNewClass(klassOop, clsData);
-    }
+    /* Push new loaded class to root class container. */
+    clsData = clsContainer->pushNewClass(klassOop);
   }
 
   return clsData;
@@ -341,7 +328,6 @@ void iterateFieldObjectCallBack(void *oop, void *data) {
 
   TSnapShotContainer *localSnapshot = containerInfo->snapshot;
   TClassCounter *parentCounter = containerInfo->counter;
-  TClassContainer *localClsContainer = containerInfo->clsContainer;
 
   TChildClassCounter *clsCounter = NULL;
 
@@ -350,8 +336,7 @@ void iterateFieldObjectCallBack(void *oop, void *data) {
 
   if (unlikely(clsCounter == NULL)) {
     /* Get child class information. */
-    TObjectData *clsData =
-        getObjectDataFromKlassOop(localClsContainer, klassOop);
+    TObjectData *clsData = getObjectDataFromKlassOop(klassOop);
     /* Push new child loaded class. */
     clsCounter = localSnapshot->pushNewChildClass(parentCounter, clsData);
   }
@@ -386,10 +371,8 @@ void iterateFieldObjectCallBack(void *oop, void *data) {
  */
 inline void calculateObjectUsage(TSnapShotContainer *snapshot, void *oop) {
   void *klassOop = getKlassOopFromOop(oop);
-  TClassContainer *workClsContainer = clsContainer->getLocalContainer();
   /* Sanity check. */
-  if (unlikely(snapshot == NULL || klassOop == NULL ||
-               workClsContainer == NULL)) {
+  if (unlikely(snapshot == NULL || klassOop == NULL)) {
     return;
   }
 
@@ -405,7 +388,7 @@ inline void calculateObjectUsage(TSnapShotContainer *snapshot, void *oop) {
   TObjectData *clsData = NULL;
 
   /* Get class information. */
-  clsData = getObjectDataFromKlassOop(workClsContainer, klassOop);
+  clsData = getObjectDataFromKlassOop(klassOop);
   if (unlikely(clsData == NULL)) {
     logger->printCritMsg("Couldn't get ObjectData!");
     return;
@@ -450,7 +433,6 @@ inline void calculateObjectUsage(TSnapShotContainer *snapshot, void *oop) {
   TCollectContainers containerInfo;
   containerInfo.snapshot = localSnapshot;
   containerInfo.counter = clsCounter;
-  containerInfo.clsContainer = workClsContainer;
 
   TOopMapBlock *offsets = NULL;
   int offsetCount = 0;

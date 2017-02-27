@@ -26,10 +26,12 @@
 
 #include <tr1/unordered_map>
 #include <tr1/unordered_set>
+#include <tbb/concurrent_unordered_set.h>
 #include <queue>
 
 #include "jvmInfo.hpp"
 #include "oopUtil.hpp"
+#include "classContainer.hpp"
 
 #if PROCESSOR_ARCH == X86
 #include "arch/x86/lock.inline.hpp"
@@ -66,25 +68,10 @@ typedef struct {
 } TObjectCounter;
 
 /*!
- * \brief This structure stored class information.
- */
-typedef struct {
-  jlong tag;          /*!< Class tag.                                 */
-  jlong classNameLen; /*!< Class name.                                */
-  char *className;    /*!< Class name length.                         */
-  void *klassOop;     /*!< Java inner class object.                   */
-  jlong oldTotalSize; /*!< Class old total use size.                  */
-  TOopType oopType;   /*!< Type of class.                             */
-  jlong clsLoaderId;  /*!< Class loader instance id.                  */
-  jlong clsLoaderTag; /*!< Class loader class tag.                    */
-  jlong instanceSize; /*!< Class size if this class is instanceKlass. */
-} TObjectData;
-
-/*!
  * \brief This type is for storing unloaded class information.
  */
-typedef std::tr1::unordered_set<TObjectData *,
-                                TNumericalHasher<void *> > TClassInfoSet;
+typedef tbb::concurrent_unordered_set<TObjectData *,
+                                TNumericalHasher<TObjectData *> > TClassInfoSet;
 
 /*!
  * \brief This structure stored child class size information.
@@ -277,7 +264,7 @@ class TSnapShotContainer {
    *         Value is null, if class is not found.
    */
   inline TChildClassCounter *findChildClass(TClassCounter *clsCounter,
-                                            void *klassOop) {
+                                            PKlassOop klassOop) {
     TChildClassCounter *prevCounter = NULL;
     TChildClassCounter *morePrevCounter = NULL;
     TChildClassCounter *counter = clsCounter->child;

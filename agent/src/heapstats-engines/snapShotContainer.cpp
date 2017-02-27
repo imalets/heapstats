@@ -21,6 +21,7 @@
 
 #include "globals.hpp"
 #include "snapShotContainer.hpp"
+#include "classContainer.hpp"
 
 /*!
  * \brief Pthread mutex for instance control.<br>

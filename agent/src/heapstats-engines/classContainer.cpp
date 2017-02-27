@@ -21,6 +21,9 @@
 
 #include <fcntl.h>
 
+#include <tbb/concurrent_unordered_set.h>
+#include <utility>
+
 #include "globals.hpp"
 #include "vmFunctions.hpp"
 #include "classContainer.hpp"
@@ -77,8 +80,12 @@ static oid OID_METASPACEALERT_MAX_CAPACITY[] = {SNMP_OID_METASPACEALERT, 3};
  */
 static char ORDER_USAGE[6] = "USAGE";
 
+/*
+static tbb::concurrent_unordered_set<TObjectData *,
+                                     TNumericalHasher<TObjectData *> >
+                                                                unloadedList;
+*/
 static TClassInfoSet unloadedList;
-volatile int unloadedList_lock = 0;
 
 /*!
  * \briefString of DELTA order.
@@ -87,81 +94,21 @@ static char ORDER_DELTA[6] = "DELTA";
 
 /*!
  * \brief TClassContainer constructor.
- * \param base      [in] Parent class container instance.
- * \param needToClr [in] Flag of deallocate all data on destructor.
  */
-TClassContainer::TClassContainer(TClassContainer *base, bool needToClr)
-    : localContainers() {
-  /* Initialize each field. */
-  lockval = 0;
-  queueLock = 0;
-  needToClear = needToClr;
-  classMap = NULL;
-  pSender = NULL;
-
-  if (likely(base != NULL)) {
-    /* Get parent container's spin lock. */
-    spinLockWait(&base->lockval);
-  }
-
-  try {
-    if (unlikely(base == NULL)) {
-      classMap = new TClassMap();
-    } else {
-      classMap = new TClassMap(*base->classMap);
-    }
-  } catch (...) {
-    /*
-     * This statement is for release lock. So allocate check is after.
-     */
-  }
-
-  if (likely(base != NULL)) {
-    /* Release parent container's spin lock. */
-    spinLockRelease(&base->lockval);
-  }
-
-  try {
-    /* Check classMap. */
-    if (unlikely(classMap == NULL)) {
-      throw 1;
-    }
-
-    /* Create trap sender. */
-    pSender = conf->SnmpSend()->get() ? new TTrapSender() : NULL;
-
-    /* Create thread storage key. */
-    if (unlikely(pthread_key_create(&clsContainerKey, NULL) != 0)) {
-      throw 1;
-    }
-  } catch (...) {
-    delete classMap;
-    delete pSender;
-    throw "TClassContainer initialize failed!";
-  }
+TClassContainer::TClassContainer(void) : classMap(), updatedClassList() {
+  /* Create trap sender. */
+  pSender = conf->SnmpSend()->get() ? new TTrapSender() : NULL;
 }
 
 /*!
  * \brief TClassContainer destructor.
  */
 TClassContainer::~TClassContainer(void) {
-  if (needToClear) {
-    /* Cleanup class information. */
-    this->allClear();
-  }
-
-  /* Cleanup ClassContainer in TLS. */
-  for (TLocalClassContainer::iterator it = localContainers.begin();
-       it != localContainers.end(); it++) {
-    delete *it;
-  }
+  /* Cleanup class information. */
+  this->allClear();
 
   /* Cleanup instances. */
-  delete classMap;
   delete pSender;
-
-  /* Cleanup thread storage key. */
-  pthread_key_delete(clsContainerKey);
 }
 
 /*!
@@ -232,111 +179,61 @@ TObjectData *TClassContainer::pushNewClass(void *klassOop) {
 TObjectData *TClassContainer::pushNewClass(void *klassOop,
                                            TObjectData *objData) {
   TObjectData *existData = NULL;
-  /* Get class container's spin lock. */
-  spinLockWait(&lockval);
-  {
-    /*
-     * Jvmti extension event "classUnload" is loose once in a while.
-     * The event forget callback occasionally when class unloading.
-     * So we need to check klassOop that was doubling.
-     */
 
-    /* Check klassOop doubling. */
-    TClassMap::iterator it = classMap->find(klassOop);
-    if (likely(it != classMap->end())) {
-      /* Store data to return value as result. */
-      TObjectData *expectData = (*it).second;
-      if (likely(expectData != NULL)) {
-        /* If adding class data is already exists. */
-        if (unlikely(expectData->className != NULL &&
-                     strcmp(objData->className, expectData->className) == 0 &&
-                     objData->clsLoaderId == expectData->clsLoaderId)) {
-          /* Return existing data on map. */
-          existData = expectData;
-        } else {
-          /* klass oop is doubling for another class. */
-          spinLockWait(&unloadedList_lock);
-          {
-            unloadedList.insert(expectData);
-          }
-          spinLockRelease(&unloadedList_lock);
-        }
-      }
-    }
-
-    if (likely(existData == NULL)) {
-      try {
-        /* Append class data. */
-        (*classMap)[klassOop] = objData;
-      } catch (...) {
-        /*
-         * Maybe failed to allocate memory at "std::map::operator[]".
-         */
+  /*
+   * Jvmti extension event "classUnload" is loose once in a while.
+   * The event forget callback occasionally when class unloading.
+   * So we need to check klassOop that was doubling.
+   */
+  auto itr = classMap.find(klassOop);
+  if (itr != classMap.end()) {
+    TObjectData *expectData = itr->second;
+    if (likely(expectData != NULL)) {
+      /* If adding class data is already exists. */
+      if (unlikely(expectData->className != NULL &&
+                   (strcmp(objData->className, expectData->className) == 0) &&
+                   (objData->clsLoaderId == expectData->clsLoaderId))) {
+        /* Return existing data on map. */
+        existData = expectData;
+      } else {
+        unloadedList.insert(expectData);
       }
     }
   }
-  /* Release class container's spin lock. */
-  spinLockRelease(&lockval);
 
-  /* If already exist class data. */
-  if (unlikely(existData != NULL)) {
-    return existData;
-  }
-
-  /* Get spin lock of containers queue. */
-  spinLockWait(&queueLock);
-  {
-    /* Broadcast to each local container. */
-    for (TLocalClassContainer::iterator it = localContainers.begin();
-         it != localContainers.end(); it++) {
-      (*it)->pushNewClass(klassOop, objData);
+  if (existData == NULL) {
+    /* Append class data. */
+    auto result = classMap.insert(std::make_pair(klassOop, objData));
+    if (!result.second) {
+      existData = result.first->second;
     }
   }
-  /* Release spin lock of containers queue. */
-  spinLockRelease(&queueLock);
-  return objData;
+
+  return (existData == NULL) ? objData : existData;
 }
 
 /*!
  * \brief Remove class from container.
+ *        Erasure in concurrent_unordered_map is thread-unsafe.
+ *        So this function have to be called at safepoint.
  * \param target [in] Remove class data.
  */
 void TClassContainer::removeClass(TObjectData *target) {
-  /* Remove item from map. Please callee has container's lock. */
-  classMap->erase(target->klassOop);
-
-  /* Get spin lock of containers queue. */
-  spinLockWait(&queueLock);
-  {
-    /* Broadcast to each local container. */
-    for (TLocalClassContainer::iterator it = localContainers.begin();
-         it != localContainers.end(); it++) {
-      /* Get local container's spin lock. */
-      spinLockWait(&(*it)->lockval);
-      { (*it)->classMap->erase(target->klassOop); }
-      /* Release local container's spin lock. */
-      spinLockRelease(&(*it)->lockval);
-    }
-  }
-  /* Release spin lock of containers queue. */
-  spinLockRelease(&queueLock);
+  classMap.unsafe_erase(target->klassOop);
 }
 
 /*!
  * \brief Remove all-class from container.
  *        This function will be called from d'tor of TClassContainer.
- *        So we do not get any lock because d'tor calls at Agent_OnUnload.
  */
 void TClassContainer::allClear(void) {
-  /* Add all TObjectData pointers in parent container map to unloadedList */
-  for (TClassMap::iterator cur = classMap->begin(); cur != classMap->end();
-       ++cur) {
+  /* Add all TObjectData pointers in container map to unloadedList */
+  for (auto cur = classMap.begin(); cur != classMap.end(); cur++) {
     unloadedList.insert(cur->second);
   }
 
   /* Release all memory for TObjectData. */
-  for (TClassInfoSet::iterator itr = unloadedList.begin();
-       itr != unloadedList.end(); itr++) {
+  for (auto itr = unloadedList.begin(); itr != unloadedList.end(); itr++) {
     free((*itr)->className);
     free(*itr);
   }
@@ -700,27 +597,10 @@ int TClassContainer::afterTakeSnapShot(TSnapShotContainer *snapshot,
   }
 
   /* Class map used snapshot output. */
-  TClassMap *workClsMap = NULL;
-  /* Get class container's spin lock. */
-  spinLockWait(&lockval);
-  {
-    try {
-      workClsMap = new TClassMap(*this->classMap);
-    } catch (...) {
-      workClsMap = NULL;
-    }
-  }
-  /* Release class container's spin lock. */
-  spinLockRelease(&lockval);
-
-  if (unlikely(workClsMap == NULL)) {
-    int raisedErrNum = errno;
-    logger->printWarnMsgWithErrno("Couldn't allocate working memory!");
-    return raisedErrNum;
-  }
+  auto workClsMap(classMap);
 
   /* Allocate return array. */
-  jlong rankCnt = workClsMap->size();
+  jlong rankCnt = workClsMap.size();
   rankCnt =
       (rankCnt < conf->RankLevel()->get()) ? rankCnt : conf->RankLevel()->get();
 
@@ -734,7 +614,6 @@ int TClassContainer::afterTakeSnapShot(TSnapShotContainer *snapshot,
   } catch (...) {
     int raisedErrNum = errno;
     logger->printWarnMsgWithErrno("Couldn't allocate working memory!");
-    delete workClsMap;
     return raisedErrNum;
   }
 
@@ -746,7 +625,6 @@ int TClassContainer::afterTakeSnapShot(TSnapShotContainer *snapshot,
     int raisedErrNum = errno;
     logger->printWarnMsgWithErrno("Could not open %s", conf->FileName()->get());
     delete sortArray;
-    delete workClsMap;
     return raisedErrNum;
   }
 
@@ -770,7 +648,6 @@ int TClassContainer::afterTakeSnapShot(TSnapShotContainer *snapshot,
     logger->printWarnMsg("Could not write snapshot");
     close(fd);
     delete sortArray;
-    delete workClsMap;
     return raisedErrNum;
   }
 
@@ -782,9 +659,8 @@ int TClassContainer::afterTakeSnapShot(TSnapShotContainer *snapshot,
   register jlong AlertThreshold = conf->getAlertThreshold();
 
   /* Loop each class. */
-  for (TClassMap::iterator it = workClsMap->begin(); it != workClsMap->end();
-       ++it) {
-    TObjectData *objData = (*it).second;
+  for (auto it = workClsMap.begin(); it != workClsMap.end(); it++) {
+    TObjectData *objData = it->second;
     TClassCounter *cur = snapshot->findClass(objData);
     /* If don't registed class yet. */
     if (unlikely(cur == NULL)) {
@@ -848,7 +724,6 @@ int TClassContainer::afterTakeSnapShot(TSnapShotContainer *snapshot,
       }
     }
   }
-  delete workClsMap;
 
   /* Set output entry count. */
   hdr.size = numEntries;
@@ -948,5 +823,8 @@ void JNICALL OnGarbageCollectionFinishForUnload(jvmtiEnv *jvmti) {
     /* Clear unloaded list. */
     unloadedList.clear();
   }
+
+  /* Clear updated data */
+  clsContainer->removeBeforeUpdatedData();
 }
 
