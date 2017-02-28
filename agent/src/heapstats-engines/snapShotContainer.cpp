@@ -19,26 +19,18 @@
  *
  */
 
+#include <utility>
+#include <algorithm>
+
 #include "globals.hpp"
 #include "snapShotContainer.hpp"
 #include "classContainer.hpp"
 
 /*!
- * \brief Pthread mutex for instance control.<br>
- * <br>
- * This mutex used in below process.<br>
- *   - TSnapShotContainer::getInstance @ snapShotContainer.cpp<br>
- *     To get older snapShotContainer instance from stockQueue.<br>
- *   - TSnapShotContainer::releaseInstance @ snapShotContainer.cpp<br>
- *     To add used snapShotContainer instance to stockQueue.<br>
- */
-pthread_mutex_t TSnapShotContainer::instanceLocker =
-    PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP;
-
-/*!
  * \brief Snapshot container instance stock queue.
  */
-TSnapShotQueue *TSnapShotContainer::stockQueue = NULL;
+tbb::concurrent_queue<TSnapShotContainer *>
+                                 *TSnapShotContainer::stockQueue = NULL;
 
 /*!
  * \brief Set of active TSnapShotContainer set
@@ -68,13 +60,12 @@ bool TSnapShotContainer::globalInitialize(void) {
  */
 void TSnapShotContainer::globalFinalize(void) {
   if (likely(stockQueue != NULL)) {
-    /* Clear snapshot in queue. */
-    while (!stockQueue->empty()) {
-      TSnapShotContainer *item = stockQueue->front();
+    TSnapShotContainer *item;
 
+    /* Clear snapshots in queue. */
+    while (stockQueue->try_pop(item)) {
       /* Deallocate snapshot instance. */
       delete item;
-      stockQueue->pop();
     }
 
     /* Deallocate stock queue. */
@@ -91,26 +82,12 @@ void TSnapShotContainer::globalFinalize(void) {
  */
 TSnapShotContainer *TSnapShotContainer::getInstance(void) {
   TSnapShotContainer *result = NULL;
-
-  ENTER_PTHREAD_SECTION(&instanceLocker) {
-    if (!stockQueue->empty()) {
-      /* Reuse snapshot container instance. */
-      result = stockQueue->front();
-      stockQueue->pop();
-    }
-
-    /* If need create new instance. */
-    if (result == NULL) {
-      /* Create new snapshot container instance. */
-      try {
-        result = new TSnapShotContainer();
-        activeSnapShots.insert(result);
-      } catch (...) {
-        result = NULL;
-      }
-    }
+  if (!stockQueue->try_pop(result)) {
+    /* Create new snapshot container instance. */
+    result = new TSnapShotContainer();
+    TActiveSnapShots::accessor acc;
+    activeSnapShots.insert(acc, result);
   }
-  EXIT_PTHREAD_SECTION(&instanceLocker)
 
   return result;
 }
@@ -126,53 +103,27 @@ void TSnapShotContainer::releaseInstance(TSnapShotContainer *instance) {
     return;
   }
 
-  bool existStockSpace = false;
-  ENTER_PTHREAD_SECTION(&instanceLocker) {
-    existStockSpace = (stockQueue->size() < MAX_STOCK_COUNT);
-  }
-  EXIT_PTHREAD_SECTION(&instanceLocker)
-
-  if (likely(existStockSpace)) {
-    /*
-     * We reset this flag.
-     * Because we need deallocating if failed to store to stock.
-     * E.g. Failed to get mutex at "pthread_mutex_lock/unlock"
-     *      or no more memory at "std::queue<T>::push()".
-     */
-    existStockSpace = false;
-
+  /*
+   * unsafe_size() might return actual size if it is accessed concurrently.
+   * However we use this function because we can use to decide cache count.
+   * SnapShot cache means best effort.
+   */
+  if (likely(stockQueue->unsafe_size() < MAX_STOCK_COUNT)) {
     /* Clear data. */
     instance->clear(false);
-
-    ENTER_PTHREAD_SECTION(&instanceLocker) {
-      try {
-        /* Store instance. */
-        stockQueue->push(instance);
-
-        existStockSpace = true;
-      } catch (...) {
-        /* Maybe faield to allocate memory. So we release instance. */
-      }
-    }
-    EXIT_PTHREAD_SECTION(&instanceLocker)
+    /* Store instance. */
+    stockQueue->push(instance);
+  } else {
+    /* Deallocate instance. */
+    activeSnapShots.erase(instance);
+    delete instance;
   }
-
-  ENTER_PTHREAD_SECTION(&instanceLocker)
-  {
-    if (unlikely(!existStockSpace)) {
-      /* Deallocate instance. */
-      activeSnapShots.erase(instance);
-      delete instance;
-    }
-  }
-  EXIT_PTHREAD_SECTION(&instanceLocker)
 }
 
 /*!
  * \brief TSnapshotContainer constructor.
  */
-TSnapShotContainer::TSnapShotContainer(bool isParent)
-    : counterMap(), containerMap() {
+TSnapShotContainer::TSnapShotContainer(void) : counterMap(), childrenMap() {
   /* Header setting. */
   this->_header.magicNumber = conf->CollectRefTree()->get()
                                 ? EXTENDED_REFTREE_SNAPSHOT
@@ -182,16 +133,6 @@ TSnapShotContainer::TSnapShotContainer(bool isParent)
   this->_header.size = 0;
   memset((void *)&this->_header.gcCause[0], 0, 80);
 
-  /* Initialize each field. */
-  lockval = 0;
-  isParentContainer = isParent;
-
-  /* Create thread storage key. */
-  if (unlikely(isParent &&
-               pthread_key_create(&snapShotContainerKey, NULL) != 0)) {
-    throw "Failed to create pthread key";
-  }
-
   this->isCleared = true;
 }
 
@@ -200,46 +141,23 @@ TSnapShotContainer::TSnapShotContainer(bool isParent)
  */
 TSnapShotContainer::~TSnapShotContainer(void) {
   /* Cleanup elements on counter map. */
-  for (TSizeMap::iterator it = counterMap.begin(); it != counterMap.end();
-       ++it) {
-    TClassCounter *clsCounter = (*it).second;
-    if (unlikely(clsCounter == NULL)) {
-      continue;
-    }
+  std::for_each(counterMap.begin(), counterMap.end(),
+                [](std::pair<TObjectData *const, TClassCounter *> &p){
+                  TClassCounter *clsCounter = p.second;
+                  free(clsCounter->offsets);
+                  free(clsCounter->counter);
+                  free(clsCounter);
+                }
+  );
 
-    /* Deallocate field block cache. */
-    free(clsCounter->offsets);
-
-    /* Deallocate children class list. */
-    TChildClassCounter *counter = clsCounter->child;
-    while (counter != NULL) {
-      TChildClassCounter *aCounter = counter;
-      counter = counter->next;
-
-      /* Deallocate TChildClassCounter. */
-      free(aCounter->counter);
-      free(aCounter);
-    }
-
-    /* Deallocate TClassCounter. */
-    free(clsCounter->counter);
-    free(clsCounter);
-  }
-
-  /* Cleanup elements on snapshot container map. */
-  for (TLocalSnapShotContainer::iterator it = containerMap.begin();
-       it != containerMap.end(); ++it) {
-    delete (*it).second;
-  }
-
-  /* Clean maps. */
-  counterMap.clear();
-  containerMap.clear();
-
-  if (isParentContainer) {
-    /* Clean thread storage key. */
-    pthread_key_delete(snapShotContainerKey);
-  }
+  /* Cleanup elements on children map. */
+  std::for_each(childrenMap.begin(), childrenMap.end(),
+                [](std::pair<TClassCounter *const, TChildClassCounter *> &p){
+                  TChildClassCounter *childCounter = p.second;
+                  free(childCounter->counter);
+                  free(childCounter);
+                }
+  );
 }
 
 /*!
@@ -272,13 +190,9 @@ TClassCounter *TSnapShotContainer::pushNewClass(TObjectData *objData) {
 
   this->clearObjectCounter(cur->counter);
 
-  try {
-    /* Set counter map. */
-    counterMap[objData] = cur;
-  } catch (...) {
-    /*
-     * Maybe failed to allocate memory at "std::map::operator[]".
-     */
+  /* Set to counter map. */
+  auto result = counterMap.emplace(objData, cur);
+  if (!result.second) {
     free(cur->counter);
     free(cur);
     cur = NULL;
@@ -314,16 +228,12 @@ TChildClassCounter *TSnapShotContainer::pushNewChildClass(
   this->clearObjectCounter(newCounter->counter);
   newCounter->objData = objData;
 
-  /* Chain children list. */
-  TChildClassCounter *counter = clsCounter->child;
-  if (unlikely(counter == NULL)) {
-    clsCounter->child = newCounter;
-  } else {
-    /* Get last counter. */
-    while (counter->next != NULL) {
-      counter = counter->next;
-    }
-    counter->next = newCounter;
+  /* Set to children map. */
+  auto result = childrenMap.emplace(clsCounter, newCounter);
+  if (!result.second) {
+    free(newCounter->counter);
+    free(newCounter);
+    newCounter = NULL;
   }
 
   return newCounter;
@@ -379,36 +289,18 @@ void TSnapShotContainer::clear(bool isForce) {
     return;
   }
 
-  /* Get snapshot container's spin lock. */
-  spinLockWait(&lockval);
-  {
-    /* Clean heap usage information. */
-    for (TSizeMap::iterator it = counterMap.begin(); it != counterMap.end();
-         ++it) {
-      TClassCounter *clsCounter = (*it).second;
-      if (unlikely(clsCounter == NULL)) {
-        continue;
-      }
+  /* Cleanup elements on counter map. */
+  std::for_each(counterMap.begin(), counterMap.end(),
+                [&](std::pair<TObjectData *const, TClassCounter *> &p){
+                   TClassCounter *clsCounter = p.second;
+                   free(clsCounter->offsets);
+                   clsCounter->offsets = NULL;
+                   clsCounter->offsetCount = -1;
 
-      /* Deallocate field block cache. */
-      free(clsCounter->offsets);
-      clsCounter->offsets = NULL;
-      clsCounter->offsetCount = -1;
-
-      /* Reset counters. */
-      this->clearChildClassCounters(clsCounter);
-    }
-
-    /* Clean local snapshots. */
-    for (TLocalSnapShotContainer::iterator it = containerMap.begin();
-         it != containerMap.end(); ++it) {
-      (*it).second->clear(true);
-    }
-
-    this->isCleared = true;
-  }
-  /* Release snapshot container's spin lock. */
-  spinLockRelease(&lockval);
+                   /* Reset counters. */
+                   clearChildClassCounters(clsCounter);
+                }
+  );
 }
 
 /*!
@@ -449,121 +341,26 @@ void TSnapShotContainer::printGCInfo(void) {
 }
 
 /*!
- * \brief Merge children data.
- */
-void TSnapShotContainer::mergeChildren(void) {
-  /* Get snapshot container's spin lock. */
-  spinLockWait(&lockval);
-  {
-    /* Loop each local snapshot container. */
-    for (TLocalSnapShotContainer::iterator it = this->containerMap.begin();
-         it != this->containerMap.end(); it++) {
-      /* Loop each class in snapshot container. */
-      TSizeMap *srcCounterMap = &(*it).second->counterMap;
-      for (TSizeMap::iterator it2 = srcCounterMap->begin();
-           it2 != srcCounterMap->end(); it2++) {
-        TClassCounter *srcClsCounter = (*it2).second;
-
-        /* Search or register class. */
-        TClassCounter *clsCounter = this->findClass((*it2).first);
-        if (unlikely(clsCounter == NULL)) {
-          clsCounter = this->pushNewClass((*it2).first);
-
-          /* If failed to search and register class. */
-          if (unlikely(clsCounter == NULL)) {
-            continue; /* Skip merge this class. */
-          }
-        }
-
-        /* Marge class heap usage. */
-        this->addInc(clsCounter->counter, srcClsCounter->counter);
-
-        /* Loop each children class. */
-        TChildClassCounter *counter = srcClsCounter->child;
-        while (counter != NULL) {
-          TObjectData *objData = counter->objData;
-
-          /* Search child class. */
-          TChildClassCounter *childClsData =
-                      this->findChildClass(clsCounter, objData->klassOop);
-
-          /* Register class as child class. */
-          if (unlikely(childClsData == NULL)) {
-            childClsData = this->pushNewChildClass(clsCounter, objData);
-          }
-
-          if (likely(childClsData != NULL)) {
-            /* Marge children class heap usage. */
-            this->addInc(childClsData->counter, counter->counter);
-          }
-
-          counter = counter->next;
-        }
-      }
-    }
-  }
-  /* Release snapshot container's spin lock. */
-  spinLockRelease(&lockval);
-}
-
-/*!
  * \brief Remove unloaded TObjectData in this snapshot container.
  *        This function should be called at safepoint.
  * \param unloadedList Set of unloaded TObjectData.
  */
 void TSnapShotContainer::removeObjectData(TClassInfoSet &unloadedList) {
-  TSizeMap::iterator itr;
-
-  /* Remove the target from parent container. */
-  for (TClassInfoSet::iterator target = unloadedList.begin();
-       target != unloadedList.end(); target++) {
-    itr = counterMap.find(*target);
+  for (auto t = unloadedList.begin(); t != unloadedList.end(); t++) {
+    auto itr = counterMap.find(*t);
     if (itr != counterMap.end()) {
-      TClassCounter *clsCounter = itr->second;
-      TChildClassCounter *childCounter = clsCounter->child;
-
-      while (childCounter != NULL) {
-        TChildClassCounter *nextCounter = childCounter->next;
-        free(childCounter->counter);
-        free(childCounter);
-        childCounter = nextCounter;
+      auto range = childrenMap.equal_range(itr->second);
+      for (auto child = range.first; child != range.second; child++) {
+        TChildClassCounter *c = child->second;
+        free(c->counter);
+        free(c);
       }
 
-      free(clsCounter->counter);
-      free(clsCounter);
-      counterMap.erase(itr);
+      childrenMap.unsafe_erase(range.first, range.second);
+      counterMap.unsafe_erase(itr);
+      free((*t)->className);
+      free(*t);
     }
-  }
-
-  /* Remove the target from all children in counterMap. */
-  for (itr = counterMap.begin(); itr != counterMap.end(); itr++) {
-    TClassCounter *clsCounter = itr->second;
-    TChildClassCounter *childCounter = clsCounter->child;
-    TChildClassCounter *prevChildCounter = NULL;
-
-    while (childCounter != NULL) {
-      TChildClassCounter *nextCounter = childCounter->next;
-
-      if (unloadedList.find(childCounter->objData) != unloadedList.end()) {
-        free(childCounter->counter);
-        free(childCounter);
-        if (prevChildCounter == NULL) {
-          clsCounter->child = nextCounter;
-        } else {
-          prevChildCounter->next = nextCounter;
-        }
-      } else {
-        prevChildCounter = childCounter;
-      }
-
-      childCounter = nextCounter;
-    }
-  }
-
-  /* Remove the target from local containers. */
-  for (TLocalSnapShotContainer::iterator container = containerMap.begin();
-       container != containerMap.end(); container++) {
-    container->second->removeObjectData(unloadedList);
   }
 }
 
@@ -573,13 +370,10 @@ void TSnapShotContainer::removeObjectData(TClassInfoSet &unloadedList) {
  */
 void TSnapShotContainer::removeObjectDataFromAllSnapShots(
                                                  TClassInfoSet &unloadedList) {
-  ENTER_PTHREAD_SECTION(&instanceLocker)
-  {
-    for (TActiveSnapShots::iterator itr = activeSnapShots.begin();
-         itr != activeSnapShots.end(); itr++) {
-      (*itr)->removeObjectData(unloadedList);
-    }
-  }
-  EXIT_PTHREAD_SECTION(&instanceLocker)
+  std::for_each(activeSnapShots.begin(), activeSnapShots.end(),
+                [&](std::pair<TSnapShotContainer *const, int> &p) {
+                  p.first->removeObjectData(unloadedList);
+                }
+  );
 }
 

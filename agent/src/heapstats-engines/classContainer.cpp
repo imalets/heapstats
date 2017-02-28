@@ -22,7 +22,6 @@
 #include <fcntl.h>
 
 #include <tbb/concurrent_unordered_set.h>
-#include <utility>
 
 #include "globals.hpp"
 #include "vmFunctions.hpp"
@@ -80,11 +79,6 @@ static oid OID_METASPACEALERT_MAX_CAPACITY[] = {SNMP_OID_METASPACEALERT, 3};
  */
 static char ORDER_USAGE[6] = "USAGE";
 
-/*
-static tbb::concurrent_unordered_set<TObjectData *,
-                                     TNumericalHasher<TObjectData *> >
-                                                                unloadedList;
-*/
 static TClassInfoSet unloadedList;
 
 /*!
@@ -203,7 +197,7 @@ TObjectData *TClassContainer::pushNewClass(void *klassOop,
 
   if (existData == NULL) {
     /* Append class data. */
-    auto result = classMap.insert(std::make_pair(klassOop, objData));
+    auto result = classMap.emplace(klassOop, objData);
     if (!result.second) {
       existData = result.first->second;
     }
@@ -463,11 +457,12 @@ inline bool sendHeapAlertTrap(TTrapSender *pSender, THeapDelta heapUsage,
  * \param fd      [in] Target file descriptor.
  * \param objData [in] The class information.
  * \param cur     [in] The class size counter.
+ * \param snapshot[in] SnapShot container.
  * \return Value is zero, if process is succeed.<br />
  *         Value is error number a.k.a. "errno", if process is failure.
  */
 inline int writeClassData(const int fd, const TObjectData *objData,
-                          const TClassCounter *cur) {
+                          TClassCounter *cur, TSnapShotContainer *snapshot) {
   int result = 0;
   /* Output class-information. */
   try {
@@ -493,9 +488,10 @@ inline int writeClassData(const int fd, const TObjectData *objData,
 
     /* Output children-class-information. */
     if (conf->CollectRefTree()->get()) {
-      TChildClassCounter *childCounter = cur->child;
+      auto itrs = snapshot->getAllChildren(cur);
+      for (auto itr = itrs.first; itr != itrs.second; itr++) {
+        TChildClassCounter *childCounter = itr->second;
 
-      while (childCounter != NULL) {
         /* If do output child class. */
         if (likely(!conf->ReduceSnapShot()->get() ||
                    (childCounter->counter->total_size > 0))) {
@@ -511,9 +507,6 @@ inline int writeClassData(const int fd, const TObjectData *objData,
             throw 1;
           }
         }
-
-        /* Move next child class. */
-        childCounter = childCounter->next;
       }
 
       /* Output end-marker of children-class-information. */
@@ -684,7 +677,7 @@ int TClassContainer::afterTakeSnapShot(TSnapShotContainer *snapshot,
     if (!conf->ReduceSnapShot()->get() || (result.usage > 0)) {
       /* Output class-information. */
       if (likely(raiseErrorCode == 0)) {
-        raiseErrorCode = writeClassData(fd, objData, cur);
+        raiseErrorCode = writeClassData(fd, objData, cur, snapshot);
       }
 
       numEntries++;

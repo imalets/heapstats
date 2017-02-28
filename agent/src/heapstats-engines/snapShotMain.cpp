@@ -65,19 +65,6 @@ TTimer *timer = NULL;
 pthread_mutex_t dumpMutex = PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP;
 
 /*!
- * \brief Pthread mutex for change snapshot queue.<br>
- * <br>
- * This mutex used in below process.<br>
- *   - TakeSnapShot @ snapShotMain.cpp<br>
- *     To add snapshot by JVMTI to output wait queue.<br>
- *   - popSnapShotQueue @ snapShotMain.cpp<br>
- *     To get snapshot from output wait queue.<br>
- *   - addSnapShotQueue @ snapShotMain.cpp<br>
- *     To add snapshot by GC to output wait queue.<br>
- */
-pthread_mutex_t queueMutex = PTHREAD_ADAPTIVE_MUTEX_INITIALIZER_NP;
-
-/*!
  * \brief Pthread mutex for JVMTI IterateOverHeap calling.<br>
  * <br>
  * This mutex used in below process.<br>
@@ -169,24 +156,8 @@ inline void setSnapShotInfo(TInvokeCause cause, TSnapShotContainer *snapshot) {
  *         So that, you should be additionally handling snapshot instance.
  */
 inline bool addSnapShotQueue(TSnapShotContainer *snapshot) {
-  bool isSucceed = false;
-  /* Push output waiting queue. */
-  ENTER_PTHREAD_SECTION(&queueMutex) {
-    try {
-      snapStockQueue.push(snapshot);
-
-      /* Reset exception flag. */
-      isSucceed = true;
-    } catch (...) {
-      /*
-       * Maybe faield to allocate memory at "std:queue<T>::push()".
-       * So we throw exception again at after release lock.
-       */
-    }
-  }
-  EXIT_PTHREAD_SECTION(&queueMutex)
-
-  return isSucceed;
+  snapStockQueue.push(snapshot);
+  return true;
 }
 
 /*!
@@ -196,17 +167,8 @@ inline bool addSnapShotQueue(TSnapShotContainer *snapshot) {
  */
 inline TSnapShotContainer *popSnapShotQueue(void) {
   TSnapShotContainer *snapshot = NULL;
-
-  /* Get snapshot data from waiting queue. */
-  ENTER_PTHREAD_SECTION(&queueMutex) {
-    if (likely(!snapStockQueue.empty())) {
-      snapshot = snapStockQueue.front();
-      snapStockQueue.pop();
-    }
-  }
-  EXIT_PTHREAD_SECTION(&queueMutex)
-
-  return snapshot;
+  bool succeeded = snapStockQueue.try_pop(snapshot);
+  return succeeded ? snapshot : NULL;
 }
 
 /*!
@@ -326,19 +288,19 @@ void iterateFieldObjectCallBack(void *oop, void *data) {
     return;
   }
 
-  TSnapShotContainer *localSnapshot = containerInfo->snapshot;
+  TSnapShotContainer *snapshot = containerInfo->snapshot;
   TClassCounter *parentCounter = containerInfo->counter;
 
   TChildClassCounter *clsCounter = NULL;
 
   /* Search child class. */
-  clsCounter = localSnapshot->findChildClass(parentCounter, klassOop);
+  clsCounter = snapshot->findChildClass(parentCounter, klassOop);
 
   if (unlikely(clsCounter == NULL)) {
     /* Get child class information. */
     TObjectData *clsData = getObjectDataFromKlassOop(klassOop);
     /* Push new child loaded class. */
-    clsCounter = localSnapshot->pushNewChildClass(parentCounter, clsData);
+    clsCounter = snapshot->pushNewChildClass(parentCounter, clsData);
   }
 
   if (unlikely(clsCounter == NULL)) {
@@ -361,7 +323,7 @@ void iterateFieldObjectCallBack(void *oop, void *data) {
   }
 
   /* Count perent class size and instance count. */
-  localSnapshot->FastInc(clsCounter->counter, size);
+  snapshot->FastInc(clsCounter->counter, size);
 }
 
 /*!
@@ -373,12 +335,6 @@ inline void calculateObjectUsage(TSnapShotContainer *snapshot, void *oop) {
   void *klassOop = getKlassOopFromOop(oop);
   /* Sanity check. */
   if (unlikely(snapshot == NULL || klassOop == NULL)) {
-    return;
-  }
-
-  TSnapShotContainer *localSnapshot = snapshot->getLocalContainer();
-  if (unlikely(localSnapshot == NULL)) {
-    logger->printCritMsg("Couldn't get local snapshot container!");
     return;
   }
 
@@ -395,10 +351,10 @@ inline void calculateObjectUsage(TSnapShotContainer *snapshot, void *oop) {
   }
 
   /* Search class. */
-  clsCounter = localSnapshot->findClass(clsData);
+  clsCounter = snapshot->findClass(clsData);
   if (unlikely(clsCounter == NULL)) {
     /* Push new loaded class. */
-    clsCounter = localSnapshot->pushNewClass(clsData);
+    clsCounter = snapshot->pushNewClass(clsData);
   }
 
   if (unlikely(clsCounter == NULL)) {
@@ -423,7 +379,7 @@ inline void calculateObjectUsage(TSnapShotContainer *snapshot, void *oop) {
   }
 
   /* Count perent class size and instance count. */
-  localSnapshot->FastInc(clsCounter->counter, size);
+  snapshot->FastInc(clsCounter->counter, size);
 
   /* If we should not collect reftree or oop has no field. */
   if (!conf->CollectRefTree()->get() || !hasOopField(oopType)) {
@@ -431,7 +387,7 @@ inline void calculateObjectUsage(TSnapShotContainer *snapshot, void *oop) {
   }
 
   TCollectContainers containerInfo;
-  containerInfo.snapshot = localSnapshot;
+  containerInfo.snapshot = snapshot;
   containerInfo.counter = clsCounter;
 
   TOopMapBlock *offsets = NULL;

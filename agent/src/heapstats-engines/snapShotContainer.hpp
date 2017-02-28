@@ -22,12 +22,11 @@
 #ifndef _SNAPSHOT_CONTAINER_HPP
 #define _SNAPSHOT_CONTAINER_HPP
 
-#include <pthread.h>
+#include <tbb/concurrent_unordered_map.h>
+#include <tbb/concurrent_hash_map.h>
+#include <tbb/concurrent_queue.h>
 
-#include <tr1/unordered_map>
-#include <tr1/unordered_set>
-#include <tbb/concurrent_unordered_set.h>
-#include <queue>
+#include <algorithm>
 
 #include "jvmInfo.hpp"
 #include "oopUtil.hpp"
@@ -68,12 +67,6 @@ typedef struct {
 } TObjectCounter;
 
 /*!
- * \brief This type is for storing unloaded class information.
- */
-typedef tbb::concurrent_unordered_set<TObjectData *,
-                                TNumericalHasher<TObjectData *> > TClassInfoSet;
-
-/*!
  * \brief This structure stored child class size information.
  */
 struct TChildClassCounter {
@@ -88,8 +81,6 @@ struct TChildClassCounter {
  */
 typedef struct {
   TObjectCounter *counter;   /*!< Java inner class object.  */
-  TChildClassCounter *child; /*!< Child class informations. */
-  volatile int spinlock;     /*!< Spin lock object.         */
   TOopMapBlock *offsets;     /*!< Offset list.              */
   int offsetCount;           /*!< Count of offset list.     */
 } TClassCounter;
@@ -123,31 +114,19 @@ typedef struct {
 class TSnapShotContainer;
 
 /*!
- * \brief This type is for queue store snapshot information.
+ * \brief Container of active snapshot list.
+ *        concurrent_unordered_set in TBB does not provide thread-safe erasure.
+ *        So we use concurrent_hash_map as set.
  */
-typedef std::queue<TSnapShotContainer *> TSnapShotQueue;
+typedef tbb::concurrent_hash_map<TSnapShotContainer *, int> TActiveSnapShots;
+
+typedef tbb::concurrent_unordered_multimap<TClassCounter *,
+         TChildClassCounter *, TNumericalHasher<TClassCounter *> > TChildrenMap;
 
 /*!
- * \brief This type is for map stored size information.
+ * \brief Snapshot container instance stock queue.
  */
-typedef std::tr1::unordered_map<TObjectData *, TClassCounter *,
-                                TNumericalHasher<void *> > TSizeMap;
-
-/*!
- * \brief This class is stored class object usage on heap.
- */
-class TSnapShotContainer;
-
-/*!
- * \brief This type is for TSnapShotContainer in Thread-Local-Storage.
- */
-typedef std::tr1::unordered_map<pthread_t, TSnapShotContainer *,
-                                TNumericalHasher<pthread_t> >
-    TLocalSnapShotContainer;
-
-typedef std::tr1::unordered_set<TSnapShotContainer *,
-                                TNumericalHasher<void *> > TActiveSnapShots;
-
+typedef tbb::concurrent_queue<TSnapShotContainer *> TSnapShotQueue;
 
 /*!
  * \brief This class is stored class object usage on heap.
@@ -252,8 +231,18 @@ class TSnapShotContainer {
    *         Value is null, if class is not found.
    */
   inline TClassCounter *findClass(TObjectData *objData) {
-    TSizeMap::iterator it = counterMap.find(objData);
-    return (it != counterMap.end()) ? (*it).second : NULL;
+    auto it = counterMap.find(objData);
+    return (it != counterMap.end()) ? it->second : NULL;
+  }
+
+  /*!
+   * \brief Get all children class data.
+   * \param clsCounter [in] Parent class counter object.
+   * \return Iterators of children map.
+   */
+  inline std::pair<TChildrenMap::iterator, TChildrenMap::iterator>
+                                     getAllChildren(TClassCounter *clsCounter) {
+    return childrenMap.equal_range(clsCounter);
   }
 
   /*!
@@ -265,43 +254,16 @@ class TSnapShotContainer {
    */
   inline TChildClassCounter *findChildClass(TClassCounter *clsCounter,
                                             PKlassOop klassOop) {
-    TChildClassCounter *prevCounter = NULL;
-    TChildClassCounter *morePrevCounter = NULL;
-    TChildClassCounter *counter = clsCounter->child;
-
-    if (counter == NULL) {
-      return NULL;
-    }
-
-    /* Search children class list. */
-    while (counter->objData->klassOop != klassOop) {
-      morePrevCounter = prevCounter;
-      prevCounter = counter;
-      counter = counter->next;
-
-      if (counter == NULL) {
-        return NULL;
+    TChildClassCounter *result = NULL;
+    auto range = childrenMap.equal_range(clsCounter);
+    for (auto itr = range.first; itr != range.second; itr++) {
+      TChildClassCounter *buf = itr->second;
+      if (buf->objData->klassOop == klassOop) {
+        result = buf;
+        break;
       }
     }
-
-    /* LFU (Least Frequently Used). */
-    if (counter != NULL) {
-      counter->callCount++;
-
-      /* If counter need move to list head. */
-      if (prevCounter != NULL && prevCounter->callCount <= counter->callCount) {
-        prevCounter->next = counter->next;
-        if (morePrevCounter != NULL) {
-          /* Move to near list head. */
-          morePrevCounter->next = counter;
-        } else {
-          /* Move list head. */
-          clsCounter->child = counter;
-        }
-        counter->next = prevCounter;
-      }
-    }
-    return counter;
+    return result;
   }
 
   /*!
@@ -331,65 +293,6 @@ class TSnapShotContainer {
   void clear(bool isForce);
 
   /*!
-   * \brief Get local snapshot container with each threads.
-   * \return Local snapshot container instance for this thread.
-   */
-  inline TSnapShotContainer *getLocalContainer(void) {
-    TSnapShotContainer *result = NULL;
-
-    /* Get root and local snapshot conatiner. */
-    result = (TSnapShotContainer *)pthread_getspecific(snapShotContainerKey);
-
-    /* If not exists local container. */
-    if (unlikely(result == NULL)) {
-      pthread_t selfThreadId = pthread_self();
-
-      /* Get snapshot container's spin lock. */
-      spinLockWait(&lockval);
-      {
-        TLocalSnapShotContainer::iterator it = containerMap.find(selfThreadId);
-        if (it != containerMap.end()) {
-          result = (*it).second;
-        }
-      }
-      /* Release snapshot container's spin lock. */
-      spinLockRelease(&lockval);
-
-      if (unlikely(result == NULL)) {
-        try {
-          result = new TSnapShotContainer(false);
-        } catch (...) {
-          /* Maybe raise badalloc exception. */
-          return NULL;
-        }
-
-        /* Get snapshot container's spin lock. */
-        spinLockWait(&lockval);
-        {
-          try {
-            containerMap[selfThreadId] = result;
-          } catch (...) {
-            /* Failed to add map. Maybe no more free memory. */
-            delete result;
-            result = NULL;
-          }
-        }
-        /* Release snapshot container's spin lock. */
-        spinLockRelease(&lockval);
-      }
-
-      /* Set local snapshot conatiner. */
-      pthread_setspecific(snapShotContainerKey, result);
-    }
-    return result;
-  }
-
-  /*!
-   * \brief Merge children data.
-   */
-  virtual void mergeChildren(void);
-
-  /*!
    * \brief Set "isCleared" flag.
    */
   inline void setIsCleared(bool flag) { this->isCleared = flag; }
@@ -411,7 +314,7 @@ class TSnapShotContainer {
   /*!
    * \brief TSnapshotContainer constructor.
    */
-  TSnapShotContainer(bool isParent = true);
+  TSnapShotContainer(void);
   /*!
    * \brief TSnapshotContainer destructor.
    */
@@ -433,18 +336,19 @@ class TSnapShotContainer {
    * \brief Zero clear to TClassCounter and its children counter.
    * \param counter TClassCounter to clear.
    */
-  void clearChildClassCounters(TClassCounter *counter);
+  inline void clearChildClassCounters(TClassCounter *counter) {
+    auto range = childrenMap.equal_range(counter);
 
-  /*!
-   * \brief Pthread mutex for instance control.<br>
-   * <br>
-   * This mutex used in below process.<br>
-   *   - TSnapShotContainer::getInstance @ snapShotContainer.cpp<br>
-   *     To get older snapShotContainer instance from stockQueue.<br>
-   *   - TSnapShotContainer::releaseInstance @ snapShotContainer.cpp<br>
-   *     To add used snapShotContainer instance to stockQueue.<br>
-   */
-  static pthread_mutex_t instanceLocker;
+    /* Reset counter of children. */
+    std::for_each(range.first, range.second,
+                [&](std::pair<TClassCounter * const, TChildClassCounter *> &p) {
+                  clearObjectCounter(p.second->counter);
+                }
+    );
+
+    /* Reset counter of all class. */
+    this->clearObjectCounter(counter->counter);
+  }
 
   /*!
    * \brief Snapshot container instance stock queue.
@@ -457,36 +361,22 @@ class TSnapShotContainer {
   const static unsigned int MAX_STOCK_COUNT = 2;
 
   /*!
-   * \brief Maps of counter of each java class.
+   * \brief Map for TClassCounter.
    */
-  TSizeMap counterMap;
+  tbb::concurrent_unordered_map<TObjectData *, TClassCounter *,
+                                TNumericalHasher<TObjectData *> > counterMap;
 
   /*!
-   * \brief Maps of TSnapShotContainer and thread.
+   * \brief Map for TChildClassCounter.
    */
-  TLocalSnapShotContainer containerMap;
+  TChildrenMap childrenMap;
 
-  RELEASE_ONLY(private :)
+ private:
 
   /*!
    * \brief Snapshot header.
    */
   volatile TSnapShotFileHeader _header;
-
-  /*!
-   * \brief SpinLock variable for each snapshot class container.
-   */
-  volatile int lockval;
-
-  /*!
-   * \brief The thread key for map of local snapshot containers.
-   */
-  pthread_key_t snapShotContainerKey;
-
-  /*!
-   * \brief Is this container is parent container ?
-   */
-  bool isParentContainer;
 
   /*!
    * \brief Is this container is cleared ?
@@ -535,26 +425,6 @@ inline void TSnapShotContainer::addInc(TObjectCounter *counter,
 inline void TSnapShotContainer::clearObjectCounter(TObjectCounter *counter) {
   counter->count = 0;
   counter->total_size = 0;
-}
-
-/*!
- * \brief Zero clear to TClassCounter and its children counter.
- * \param counter TClassCounter to clear.
- */
-inline void TSnapShotContainer::clearChildClassCounters(
-    TClassCounter *counter) {
-  /* Reset counter of children class. */
-  TChildClassCounter *child_counter = counter->child;
-  while (child_counter != NULL) {
-    child_counter->counter->count = 0;
-    child_counter->counter->total_size = 0;
-
-    // child_counter->callCount >>= 1;
-    child_counter = child_counter->next;
-  }
-
-  /* Reset counter of all class. */
-  this->clearObjectCounter(counter->counter);
 }
 
 #endif

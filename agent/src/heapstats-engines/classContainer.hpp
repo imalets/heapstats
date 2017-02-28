@@ -76,6 +76,12 @@ typedef struct {
 typedef enum { ALERT_JAVA_HEAP, ALERT_METASPACE } TMemoryUsageAlertType;
 
 /*!
+ * \brief This type is for storing unloaded class information.
+ */
+typedef tbb::concurrent_unordered_set<TObjectData *,
+                                TNumericalHasher<TObjectData *> > TClassInfoSet;
+
+/*!
  * \brief This class is stored class information.<br>
  *        e.g. class-name, class instance count, size, etc...
  */

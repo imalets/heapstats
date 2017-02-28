@@ -2,7 +2,7 @@
  * \file snapShotContainer.inline.hpp
  * \brief This file is used to add up using size every class.
  *        This source is optimized for NEON instruction set.
- * Copyright (C) 2015 Yasumasa Suenaga
+ * Copyright (C) 2015-2017 Yasumasa Suenaga
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -52,31 +52,6 @@ inline void TSnapShotContainer::clearObjectCounter(TObjectCounter *counter) {
     :
     : "r"(counter)
     : "%q0"
-  );
-}
-
-/*!
- * \brief Zero clear to TClassCounter and its children counter.
- * \param counter TClassCounter to clear.
- */
-inline void TSnapShotContainer::clearChildClassCounters(
-    TClassCounter *counter) {
-  asm volatile(
-    "vbic.I64 %%q0, %%q0, %%q0;"
-    "ldr      %%r0, [%0, #4];" /* clsCounter->child */
-    "1:"
-    "  tst    %%r0, %%r0;"
-    "  beq    2f;"
-    "  ldr    %%r1,   [%%r0];" /* child->counter */
-    "  vst1.8 {%%q0}, [%%r1];"
-    "  ldr    %%r0,   [%%r0, #8];" /* child->next */
-    "  b      1b;"
-    "2:"
-    "  ldr    %%r0,   [%0];" /* clsCounter->counter */
-    "  vst1.8 {%%q0}, [%%r0];"
-    :
-    : "r"(counter)
-    : "cc", "%q0", "%r0", "%r1"
   );
 }
 

@@ -2,7 +2,7 @@
  * \file snapShotContainer.inline.hpp
  * \brief This file is used to add up using size every class.
  *        This source is optimized for AVX instruction set.
- * Copyright (C) 2014 Yasumasa Suenaga
+ * Copyright (C) 2014-2017 Yasumasa Suenaga
  *
  * This program is free software; you can redistribute it and/or
  * modify it under the terms of the GNU General Public License
@@ -53,55 +53,6 @@ inline void TSnapShotContainer::clearObjectCounter(TObjectCounter *counter) {
     : "r"(counter)
     : "%xmm0"
   );
-}
-
-/*!
- * \brief Zero clear to TClassCounter and its children counter.
- * \param counter TClassCounter to clear.
- */
-inline void TSnapShotContainer::clearChildClassCounters(
-    TClassCounter *counter) {
-#ifdef __amd64__
-  asm volatile(
-    "vpxor %%xmm0, %%xmm0, %%xmm0;"
-    "movq   8(%0), %%rax;" /* clsCounter->child */
-
-    ".align 16;"
-    "1:"
-    "  testq       %%rax,   %%rax;"
-    "  jz 2f;"
-    "  movq      (%%rax),   %%rbx;" /* child->counter */
-    "  vmovdqa    %%xmm0, (%%rbx);"
-    "  movq    16(%%rax),   %%rax;" /* child->next */
-    "  jmp 1b;"
-    "2:"
-    "  movq      (%0),  %%rbx;" /* clsCounter->counter */
-    "  vmovdqa %%xmm0, (%%rbx);"
-    :
-    : "r"(counter)
-    : "%xmm0", "%rax", "%rbx", "cc"
-  );
-#else  // i386
-  asm volatile(
-    "vpxor %%xmm0, %%xmm0, %%xmm0;"
-    "movl   4(%0), %%eax;" /* clsCounter->child */
-
-    ".align 16;"
-    "1:"
-    "  testl      %%eax,   %%eax;"
-    "  jz 2f;"
-    "  movl     (%%eax),   %%ecx;" /* child->counter */
-    "  vmovdqa   %%xmm0, (%%ecx);"
-    "  movl    8(%%eax),   %%eax;" /* child->next */
-    "  jmp 1b;"
-    "2:"
-    "  movl      (%0),  %%ecx;" /* clsCounter->counter */
-    "  vmovdqa %%xmm0, (%%ecx);"
-    :
-    : "r"(counter)
-    : "%xmm0", "%eax", "%ecx", "cc"
-  );
-#endif
 }
 
 #endif  // AVX_SNAPSHOTCONTAINER_INLINE_H
