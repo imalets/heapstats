@@ -54,6 +54,9 @@ AC_CACHE_SAVE
 AC_CHECK_LIB([iberty], [main], [], [])
 AC_CHECK_LIB([bfd], [main], [],
   [AC_MSG_ERROR([BFD library was not found.])])
+AC_CHECK_LIB([tbb], [main], [], [AC_MSG_ERROR([TBB library was not found.])])
+AC_CHECK_LIB([pthread], [main], [],
+  [AC_MSG_ERROR([Posix thread library was not found.])])
 AC_CACHE_SAVE
 
 # Checks for common header files.
@@ -73,12 +76,11 @@ AC_CHECK_HEADERS([sys/auxv.h], [], [])  # Supplemental headers
 AC_CACHE_SAVE
 
 # Check C++11 regex
-AC_MSG_CHECKING([for std::regex])
-
 AC_LANG_PUSH([C++])
 ORIG_CXXFLAGS=$CXXFLAGS
 CXXFLAGS+=" -std=c++11"
 
+AC_MSG_CHECKING([for std::regex])
 AC_RUN_IFELSE(
   [AC_LANG_PROGRAM(
     [[
@@ -99,6 +101,13 @@ AC_RUN_IFELSE(
   ]
 )
 AM_CONDITIONAL(USE_PCRE, test -n "${ac_cv_header_pcre_h}")
+
+AC_CHECK_HEADERS([ \
+  tbb/concurrent_unordered_map.h tbb/concurrent_unordered_set.h \
+  ], [], [AC_MSG_ERROR([Not found common header files.])])
+
+AC_CHECK_HEADERS([sys/auxv.h], [], [])  # Supplemental headers
+
 AC_LANG_POP([C++])
 
 # Checks for library header files.
